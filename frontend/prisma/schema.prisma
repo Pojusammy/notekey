@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String         @id @default(uuid()) @db.Uuid
+  name         String         @db.VarChar(255)
+  email        String         @unique @db.VarChar(255)
+  authProvider String         @default("email") @map("auth_provider") @db.VarChar(50)
+  createdAt    DateTime       @default(now()) @map("created_at")
+  jobs         AnalysisJob[]
+  sessions     SavedSession[]
+
+  @@map("users")
+}
+
+model AnalysisJob {
+  id           String          @id @default(uuid()) @db.Uuid
+  userId       String?         @map("user_id") @db.Uuid
+  jobType      JobType         @map("job_type")
+  inputFileUrl String?         @map("input_file_url")
+  selectedKey  String          @default("C") @map("selected_key") @db.VarChar(10)
+  status       JobStatus       @default(pending)
+  createdAt    DateTime        @default(now()) @map("created_at")
+  completedAt  DateTime?       @map("completed_at")
+  errorMessage String?         @map("error_message")
+  user         User?           @relation(fields: [userId], references: [id])
+  result       AnalysisResult?
+
+  @@map("analysis_jobs")
+}
+
+model AnalysisResult {
+  id               String        @id @default(uuid()) @db.Uuid
+  jobId            String        @unique @map("job_id") @db.Uuid
+  noteName         String?       @map("note_name") @db.VarChar(10)
+  frequencyHz      Float?        @map("frequency_hz")
+  centsOffset      Float?        @map("cents_offset")
+  tonicSolfa       String?       @map("tonic_solfa") @db.VarChar(10)
+  rawNoteSequence  Json?         @map("raw_note_sequence")
+  solfaSequence    Json?         @map("solfa_sequence")
+  timestampsJson   Json?         @map("timestamps_json")
+  confidenceScore  Float?        @map("confidence_score")
+  job              AnalysisJob   @relation(fields: [jobId], references: [id])
+  savedSession     SavedSession?
+
+  @@map("analysis_results")
+}
+
+model SavedSession {
+  id        String         @id @default(uuid()) @db.Uuid
+  userId    String?        @map("user_id") @db.Uuid
+  title     String         @default("Untitled") @db.VarChar(255)
+  resultId  String         @unique @map("result_id") @db.Uuid
+  createdAt DateTime       @default(now()) @map("created_at")
+  user      User?          @relation(fields: [userId], references: [id])
+  result    AnalysisResult @relation(fields: [resultId], references: [id])
+
+  @@map("saved_sessions")
+}
+
+enum JobType {
+  note_detection
+  recording_analysis
+
+  @@map("job_type_enum")
+}
+
+enum JobStatus {
+  pending
+  processing
+  completed
+  failed
+
+  @@map("job_status_enum")
+}
