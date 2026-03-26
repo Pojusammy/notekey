@@ -9,7 +9,7 @@ celery[redis]==5.4.0
 redis==5.2.1
 boto3==1.35.86
 librosa==0.10.2.post1
-basic-pitch==0.6.1
+basic-pitch>=0.4.0
 numpy==1.26.4
 soundfile==0.13.1
 pydantic==2.10.4
