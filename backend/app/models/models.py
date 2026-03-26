@@ -32,6 +32,10 @@ class AnalysisJob(Base):
     )
     input_file_url = Column(Text, nullable=True)
     selected_key = Column(String(10), nullable=False, default="C")
+    start_time = Column(String(20), nullable=True)
+    end_time = Column(String(20), nullable=True)
+    song_key = Column(String(10), nullable=True)
+    starting_note = Column(String(10), nullable=True)
     status = Column(
         Enum("pending", "processing", "completed", "failed", name="job_status_enum"),
         nullable=False,

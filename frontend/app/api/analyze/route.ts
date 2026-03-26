@@ -3,8 +3,10 @@ import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 
-// In-memory job store for development (replace with DB in production)
-const jobs = globalThis as unknown as {
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
+
+// In-memory job store (fallback when Python backend is unavailable)
+const store = globalThis as unknown as {
   __jobs?: Map<string, {
     status: string;
     selectedKey: string;
@@ -25,180 +27,137 @@ const jobs = globalThis as unknown as {
   }>;
 };
 
-if (!jobs.__jobs) jobs.__jobs = new Map();
-if (!jobs.__results) jobs.__results = new Map();
+if (!store.__jobs) store.__jobs = new Map();
+if (!store.__results) store.__results = new Map();
 
-export { jobs as jobStore };
+export { store as jobStore };
 
-// ── Note name constants for MIDI → note mapping ──
+// ── Helpers for JS fallback ──
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] as const;
-
 const CHROMATIC_SOLFA = [
   "Do", "Di", "Re", "Ri", "Mi", "Fa",
   "Fi", "Sol", "Si", "La", "Li", "Ti",
 ] as const;
 
-function midiToNoteName(midi: number): { noteName: string; octave: number } {
-  const noteIdx = ((midi % 12) + 12) % 12;
-  const octave = Math.floor(midi / 12) - 1;
-  return { noteName: NOTE_NAMES[noteIdx], octave };
+function midiToNoteName(midi: number) {
+  return { noteName: NOTE_NAMES[((midi % 12) + 12) % 12], octave: Math.floor(midi / 12) - 1 };
 }
-
-function midiToFrequency(midi: number): number {
+function midiToFrequency(midi: number) {
   return 440 * Math.pow(2, (midi - 69) / 12);
 }
-
-function noteToSolfa(noteName: string, key: string): string {
-  const noteIdx = NOTE_NAMES.indexOf(noteName as typeof NOTE_NAMES[number]);
-  const keyIdx = NOTE_NAMES.indexOf(key as typeof NOTE_NAMES[number]);
-  if (noteIdx === -1 || keyIdx === -1) return "Do";
-  const interval = ((noteIdx - keyIdx) % 12 + 12) % 12;
-  return CHROMATIC_SOLFA[interval];
+function noteToSolfa(noteName: string, key: string) {
+  const ni = NOTE_NAMES.indexOf(noteName as typeof NOTE_NAMES[number]);
+  const ki = NOTE_NAMES.indexOf(key as typeof NOTE_NAMES[number]);
+  if (ni === -1 || ki === -1) return "Do";
+  return CHROMATIC_SOLFA[((ni - ki) % 12 + 12) % 12];
 }
-
 function parseTimeString(time: string): number {
-  if (!time || !time.trim()) return 0;
+  if (!time?.trim()) return 0;
   const parts = time.trim().split(":").map(Number);
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
+  return parts.length === 2 ? parts[0] * 60 + parts[1] : parts[0] || 0;
 }
 
-/**
- * Run Basic Pitch analysis on a file. This is async and sets
- * results in the in-memory store when done.
- */
-async function runAnalysis(jobId: string) {
-  const job = jobs.__jobs!.get(jobId);
+// ── Try Python backend first, fall back to JS Basic Pitch ──
+
+async function tryPythonBackend(body: Record<string, unknown>): Promise<{ jobId: string } | null> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      console.log("[analyze] Proxied to Python backend, jobId:", data.jobId);
+      return data;
+    }
+  } catch {
+    // Backend not available — fall through to JS
+  }
+  return null;
+}
+
+async function runLocalAnalysis(jobId: string) {
+  const job = store.__jobs!.get(jobId);
   if (!job) return;
 
   try {
-    // Dynamic imports to avoid bundling issues
     const { decodeAudioToFloat32 } = await import("@/utils/audio-decode");
     const tf = await import("@tensorflow/tfjs");
     const { BasicPitch, outputToNotesPoly, noteFramesToTime, addPitchBendsToNoteEvents } =
       await import("@spotify/basic-pitch");
 
-    // 1. Decode audio to Float32Array at 22050Hz
     const decodeOpts: { startTime?: number; endTime?: number } = {};
     if (job.startTime) decodeOpts.startTime = parseTimeString(job.startTime);
     if (job.endTime) decodeOpts.endTime = parseTimeString(job.endTime);
 
-    console.log(`[analyze] Decoding audio: ${job.fileUrl}`, decodeOpts);
+    console.log(`[analyze:local] Decoding audio: ${job.fileUrl}`, decodeOpts);
     const { samples, durationSecs } = await decodeAudioToFloat32(job.fileUrl, decodeOpts);
-    console.log(`[analyze] Decoded ${samples.length} samples (${durationSecs.toFixed(1)}s)`);
+    console.log(`[analyze:local] Decoded ${samples.length} samples (${durationSecs.toFixed(1)}s)`);
 
-    // 2. Load Basic Pitch model from disk into memory
-    //    (Node's fetch doesn't support file:// URLs, so we read manually)
-    const modelDir = path.resolve(
-      process.cwd(),
-      "node_modules/@spotify/basic-pitch/model"
-    );
+    // Load model from disk
+    const modelDir = path.resolve(process.cwd(), "node_modules/@spotify/basic-pitch/model");
     const modelJson = JSON.parse(fs.readFileSync(path.join(modelDir, "model.json"), "utf-8"));
     const weightData = fs.readFileSync(path.join(modelDir, "group1-shard1of1.bin"));
-    const weightBuffer = weightData.buffer.slice(
-      weightData.byteOffset,
-      weightData.byteOffset + weightData.byteLength
-    );
+    const weightBuffer = weightData.buffer.slice(weightData.byteOffset, weightData.byteOffset + weightData.byteLength);
 
-    const modelArtifacts = {
+    const model = tf.loadGraphModel(tf.io.fromMemory({
       modelTopology: modelJson.modelTopology,
       weightSpecs: modelJson.weightsManifest[0].weights,
       weightData: weightBuffer,
       format: modelJson.format,
       generatedBy: modelJson.generatedBy,
       convertedBy: modelJson.convertedBy,
-    };
-
-    console.log(`[analyze] Loading Basic Pitch model from memory...`);
-    const model = tf.loadGraphModel(tf.io.fromMemory(modelArtifacts));
+    }));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const basicPitch = new BasicPitch(model as any);
 
-    // 3. Run inference
     const frames: number[][] = [];
     const onsets: number[][] = [];
     const contours: number[][] = [];
 
-    console.log("[analyze] Running Basic Pitch inference...");
+    console.log("[analyze:local] Running inference...");
     await basicPitch.evaluateModel(
       samples,
-      (f: number[][], o: number[][], c: number[][]) => {
-        frames.push(...f);
-        onsets.push(...o);
-        contours.push(...c);
-      },
-      (percent: number) => {
-        if (Math.round(percent * 100) % 25 === 0) {
-          console.log(`[analyze] Progress: ${Math.round(percent * 100)}%`);
-        }
-      }
+      (f: number[][], o: number[][], c: number[][]) => { frames.push(...f); onsets.push(...o); contours.push(...c); },
+      (pct: number) => { if (Math.round(pct * 100) % 25 === 0) console.log(`[analyze:local] ${Math.round(pct * 100)}%`); }
     );
 
-    console.log(`[analyze] Inference complete. ${frames.length} frames.`);
+    const noteEvents = outputToNotesPoly(frames, onsets, 0.5, 0.3, 11, true, null, null, true, 11);
+    const noteEventsInTime = noteFramesToTime(addPitchBendsToNoteEvents(contours, noteEvents));
 
-    // 4. Post-process: extract note events
-    const noteEvents = outputToNotesPoly(
-      frames,
-      onsets,
-      0.5,   // onsetThreshold — higher = fewer false positives
-      0.3,   // frameThreshold
-      11,    // minNoteLen in frames (~127ms)
-      true,  // inferOnsets
-      null,  // maxFreq
-      null,  // minFreq
-      true,  // melodiaTrick — helps with monophonic melodies
-      11,    // energyTolerance
-    );
-
-    const noteEventsWithBends = addPitchBendsToNoteEvents(contours, noteEvents);
-    const noteEventsInTime = noteFramesToTime(noteEventsWithBends);
-
-    console.log(`[analyze] Detected ${noteEventsInTime.length} note events.`);
-
-    // 5. Determine the key to use for solfa mapping
     const effectiveKey = job.songKey || job.selectedKey || "C";
-
-    // 6. Convert to our app's note format
     const noteSequence = noteEventsInTime
       .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds)
-      .map((event) => {
-        const midi = Math.round(event.pitchMidi);
+      .map((ev) => {
+        const midi = Math.round(ev.pitchMidi);
         const { noteName, octave } = midiToNoteName(midi);
-        const frequency = midiToFrequency(midi);
-        const solfa = noteToSolfa(noteName, effectiveKey);
-
         return {
-          noteName,
-          octave,
-          startTime: +event.startTimeSeconds.toFixed(3),
-          duration: +event.durationSeconds.toFixed(3),
-          frequency: +frequency.toFixed(2),
-          solfa,
+          noteName, octave,
+          startTime: +ev.startTimeSeconds.toFixed(3),
+          duration: +ev.durationSeconds.toFixed(3),
+          frequency: +midiToFrequency(midi).toFixed(2),
+          solfa: noteToSolfa(noteName, effectiveKey),
         };
       });
 
-    const solfaSequence = noteSequence.map((n) => n.solfa);
+    const avgAmp = noteEventsInTime.length > 0
+      ? noteEventsInTime.reduce((s, e) => s + e.amplitude, 0) / noteEventsInTime.length
+      : 0;
 
-    // 7. Compute a confidence score from average amplitude
-    const avgAmplitude =
-      noteEventsInTime.length > 0
-        ? noteEventsInTime.reduce((sum, e) => sum + e.amplitude, 0) / noteEventsInTime.length
-        : 0;
-    const confidenceScore = +Math.min(0.99, Math.max(0.5, avgAmplitude * 1.2)).toFixed(3);
-
-    // 8. Store results
-    jobs.__results!.set(jobId, {
+    store.__results!.set(jobId, {
       id: randomUUID(),
       noteSequence,
-      solfaSequence,
-      confidenceScore,
+      solfaSequence: noteSequence.map((n) => n.solfa),
+      confidenceScore: +Math.min(0.99, Math.max(0.5, avgAmp * 1.2)).toFixed(3),
     });
 
     job.status = "completed";
     job.completedAt = new Date().toISOString();
-    console.log(`[analyze] Job ${jobId} completed. ${noteSequence.length} notes detected.`);
+    console.log(`[analyze:local] Job ${jobId} completed. ${noteSequence.length} notes.`);
   } catch (err) {
-    console.error(`[analyze] Job ${jobId} failed:`, err);
+    console.error(`[analyze:local] Job ${jobId} failed:`, err);
     job.status = "failed";
     job.errorMessage = err instanceof Error ? err.message : "Analysis failed";
   }
@@ -213,13 +172,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ detail: "fileUrl is required" }, { status: 400 });
     }
 
+    // Try Python backend first (production path)
+    const backendResult = await tryPythonBackend(body);
+    if (backendResult) {
+      // Backend accepted — polling will go through /api/jobs/[id] and /api/results/[id]
+      // which also proxy to the backend
+      return NextResponse.json(backendResult);
+    }
+
+    // Fallback: local JS analysis
+    console.log("[analyze] Python backend unavailable, using local JS analysis");
+
     if (!fs.existsSync(fileUrl)) {
       return NextResponse.json({ detail: "Uploaded file not found" }, { status: 404 });
     }
 
     const jobId = randomUUID();
-
-    jobs.__jobs!.set(jobId, {
+    store.__jobs!.set(jobId, {
       status: "processing",
       selectedKey,
       fileUrl,
@@ -230,14 +199,10 @@ export async function POST(req: NextRequest) {
       createdAt: new Date().toISOString(),
     });
 
-    // Fire off analysis in the background (non-blocking)
-    runAnalysis(jobId).catch((err) => {
+    runLocalAnalysis(jobId).catch((err) => {
       console.error(`[analyze] Unhandled error for job ${jobId}:`, err);
-      const job = jobs.__jobs!.get(jobId);
-      if (job) {
-        job.status = "failed";
-        job.errorMessage = "Unexpected analysis error";
-      }
+      const job = store.__jobs!.get(jobId);
+      if (job) { job.status = "failed"; job.errorMessage = "Unexpected analysis error"; }
     });
 
     return NextResponse.json({ jobId });

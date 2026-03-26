@@ -3,6 +3,7 @@ import { writeFile, mkdir } from "fs/promises";
 import path from "path";
 import { randomUUID } from "crypto";
 
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 
 const ALLOWED_EXTENSIONS = new Set([
@@ -33,7 +34,26 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Ensure upload directory exists
+    // Try proxying to Python backend first
+    try {
+      const backendForm = new FormData();
+      backendForm.append("file", file);
+      const res = await fetch(`${BACKEND_URL}/api/upload`, {
+        method: "POST",
+        body: backendForm,
+        signal: AbortSignal.timeout(30000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        console.log("[upload] Proxied to Python backend");
+        return NextResponse.json(data);
+      }
+    } catch {
+      // Backend unavailable — fall through to local storage
+    }
+
+    // Local fallback
+    console.log("[upload] Python backend unavailable, saving locally");
     await mkdir(UPLOAD_DIR, { recursive: true });
 
     const fileId = randomUUID();

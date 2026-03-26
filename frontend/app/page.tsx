@@ -29,7 +29,7 @@ export default function DetectorPage() {
     try {
       await detector.start((result) => {
         if (result.frequency === 0 || result.clarity < 0.8) {
-          setCurrentNote(null);
+          // Don't clear — keep the last detected note visible
           return;
         }
         const { noteName, octave, centsOffset } = frequencyToNote(result.frequency);

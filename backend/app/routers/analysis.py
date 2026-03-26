@@ -26,6 +26,10 @@ async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)
         job_type="recording_analysis",
         input_file_url=req.fileUrl,
         selected_key=req.selectedKey,
+        start_time=req.startTime,
+        end_time=req.endTime,
+        song_key=req.songKey,
+        starting_note=req.startingNote,
         status="pending",
     )
     db.add(job)

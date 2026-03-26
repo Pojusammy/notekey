@@ -14,6 +14,10 @@ class UploadResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     fileUrl: str
     selectedKey: str = "C"
+    startTime: str | None = None
+    endTime: str | None = None
+    songKey: str | None = None
+    startingNote: str | None = None
 
 
 class AnalyzeResponse(BaseModel):

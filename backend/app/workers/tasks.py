@@ -29,7 +29,14 @@ def process_analysis(self, job_id: str):
         session.commit()
 
         # Run analysis
-        result_data = analyze_melody(job.input_file_url, job.selected_key)
+        result_data = analyze_melody(
+            file_path=job.input_file_url,
+            selected_key=job.selected_key,
+            start_time=job.start_time,
+            end_time=job.end_time,
+            song_key=job.song_key,
+            starting_note=job.starting_note,
+        )
 
         # Store result
         analysis_result = AnalysisResult(
