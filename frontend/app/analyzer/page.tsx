@@ -11,8 +11,14 @@ import { NOTE_NAMES } from "@/types/music";
 
 const FORMATS = ["MP3", "WAV", "M4A", "AAC", "MP4", "MOV", "WEBM"];
 
+type AnalysisMode = "standard" | "fast";
 type SourceType = "vocal" | "instrument" | "mixed";
 type RangeProfile = "general" | "male_vocal" | "female_vocal" | "instrument_lead";
+
+const ANALYSIS_MODE_OPTIONS: { value: AnalysisMode; label: string; hint: string }[] = [
+  { value: "standard", label: "Standard lead", hint: "Clean, stable melody" },
+  { value: "fast", label: "Fast interlude", hint: "Runs, trills & syncopation" },
+];
 
 const SOURCE_LABELS: Record<SourceType, string> = {
   vocal: "Vocal",
@@ -76,6 +82,7 @@ export default function AnalyzerPage() {
   const [endTime, setEndTime] = useState("");
   const [songKey, setSongKey] = useState<NoteName | "">("");
   const [startingNote, setStartingNote] = useState<NoteName | "">("");
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("standard");
   const [sourceType, setSourceType] = useState<SourceType>("vocal");
   const [rangeProfile, setRangeProfile] = useState<RangeProfile>("general");
   const [expandedPhrases, setExpandedPhrases] = useState<Set<number>>(new Set());
@@ -129,6 +136,7 @@ export default function AnalyzerPage() {
       const { jobId } = await api.startAnalysis({
         fileUrl,
         selectedKey,
+        analysisMode,
         ...(startTime && { startTime }),
         ...(endTime && { endTime }),
         ...(songKey && { songKey }),
@@ -173,7 +181,7 @@ export default function AnalyzerPage() {
       setUploading(false);
       setCurrentJob(null);
     }
-  }, [selectedFile, selectedKey, startTime, endTime, songKey, startingNote, setUploading, setUploadProgress, setCurrentJob, setCurrentResult]);
+  }, [selectedFile, selectedKey, analysisMode, startTime, endTime, songKey, startingNote, setUploading, setUploadProgress, setCurrentJob, setCurrentResult]);
 
   const handleReset = () => {
     reset();
@@ -181,6 +189,7 @@ export default function AnalyzerPage() {
     setError(null);
     setProcessingStep("");
     setProcessingProgress(0);
+    setAnalysisMode("standard");
     setStartTime("");
     setEndTime("");
     setSongKey("");
@@ -285,31 +294,55 @@ export default function AnalyzerPage() {
                   Extraction settings
                 </h3>
 
-                {/* Analysis mode (static) + Source type */}
-                <div className="mt-4 grid grid-cols-2 gap-3">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-muted">
-                      Analysis mode
-                    </label>
-                    <div className="flex items-center gap-2 rounded-lg border border-lime/20 bg-lime-dim px-3 py-2.5">
-                      <span className="h-[6px] w-[6px] rounded-full bg-lime" />
-                      <span className="font-mono text-[13px] text-lime">Lead melody only</span>
-                    </div>
+                {/* Analysis mode toggle */}
+                <div className="mt-4">
+                  <label className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-muted">
+                    Analysis mode
+                  </label>
+                  <div className="mt-1.5 grid grid-cols-2 gap-2">
+                    {ANALYSIS_MODE_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setAnalysisMode(opt.value)}
+                        className={cn(
+                          "flex flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-all",
+                          analysisMode === opt.value
+                            ? "border-lime/30 bg-lime-dim"
+                            : "border-border-subtle bg-surface-2 hover:border-border-strong"
+                        )}
+                      >
+                        <span className={cn(
+                          "flex items-center gap-2 font-mono text-[13px] font-medium",
+                          analysisMode === opt.value ? "text-lime" : "text-text-primary"
+                        )}>
+                          <span className={cn(
+                            "h-[6px] w-[6px] rounded-full",
+                            analysisMode === opt.value ? "bg-lime" : "bg-text-muted/40"
+                          )} />
+                          {opt.label}
+                        </span>
+                        <span className="pl-[14px] text-[10px] text-text-muted">
+                          {opt.hint}
+                        </span>
+                      </button>
+                    ))}
                   </div>
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-muted">
-                      Source type
-                    </label>
-                    <select
-                      value={sourceType}
-                      onChange={(e) => setSourceType(e.target.value as SourceType)}
-                      className="rounded-lg border border-border-subtle bg-surface-2 px-3 py-2.5 font-mono text-[13px] text-text-primary transition-colors focus:border-lime focus:outline-none appearance-none"
-                    >
-                      {Object.entries(SOURCE_LABELS).map(([val, label]) => (
-                        <option key={val} value={val}>{label}</option>
-                      ))}
-                    </select>
-                  </div>
+                </div>
+
+                {/* Source type */}
+                <div className="mt-3 flex flex-col gap-1.5">
+                  <label className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-muted">
+                    Source type
+                  </label>
+                  <select
+                    value={sourceType}
+                    onChange={(e) => setSourceType(e.target.value as SourceType)}
+                    className="rounded-lg border border-border-subtle bg-surface-2 px-3 py-2.5 font-mono text-[13px] text-text-primary transition-colors focus:border-lime focus:outline-none appearance-none"
+                  >
+                    {Object.entries(SOURCE_LABELS).map(([val, label]) => (
+                      <option key={val} value={val}>{label}</option>
+                    ))}
+                  </select>
                 </div>
 
                 {/* Range profile */}

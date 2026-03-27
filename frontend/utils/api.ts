@@ -68,6 +68,7 @@ export const api = {
     endTime?: string;
     songKey?: string;
     startingNote?: string;
+    analysisMode?: string;
   }) {
     return request<{ jobId: string }>("/api/analyze", {
       method: "POST",
