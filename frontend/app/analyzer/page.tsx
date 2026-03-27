@@ -11,13 +11,14 @@ import { NOTE_NAMES } from "@/types/music";
 
 const FORMATS = ["MP3", "WAV", "M4A", "AAC", "MP4", "MOV", "WEBM"];
 
-type AnalysisMode = "standard" | "fast";
+type AnalysisMode = "standard" | "fast" | "roots";
 type SourceType = "vocal" | "instrument" | "mixed";
 type RangeProfile = "general" | "male_vocal" | "female_vocal" | "instrument_lead";
 
 const ANALYSIS_MODE_OPTIONS: { value: AnalysisMode; label: string; hint: string }[] = [
   { value: "standard", label: "Standard lead", hint: "Clean, stable melody" },
   { value: "fast", label: "Fast interlude", hint: "Runs, trills & syncopation" },
+  { value: "roots", label: "Root progression", hint: "Chord roots from full audio" },
 ];
 
 const SOURCE_LABELS: Record<SourceType, string> = {
@@ -299,7 +300,7 @@ export default function AnalyzerPage() {
                   <label className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-muted">
                     Analysis mode
                   </label>
-                  <div className="mt-1.5 grid grid-cols-2 gap-2">
+                  <div className="mt-1.5 grid grid-cols-3 gap-2">
                     {ANALYSIS_MODE_OPTIONS.map((opt) => (
                       <button
                         key={opt.value}
@@ -312,11 +313,11 @@ export default function AnalyzerPage() {
                         )}
                       >
                         <span className={cn(
-                          "flex items-center gap-2 font-mono text-[13px] font-medium",
+                          "flex items-center gap-2 font-mono text-[12px] font-medium",
                           analysisMode === opt.value ? "text-lime" : "text-text-primary"
                         )}>
                           <span className={cn(
-                            "h-[6px] w-[6px] rounded-full",
+                            "h-[6px] w-[6px] shrink-0 rounded-full",
                             analysisMode === opt.value ? "bg-lime" : "bg-text-muted/40"
                           )} />
                           {opt.label}

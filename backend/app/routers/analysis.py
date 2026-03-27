@@ -96,7 +96,7 @@ async def _process_job(job_id: str, file_url: str, selected_key: str,
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)):
     job_id = uuid.uuid4()
-    analysis_mode = req.analysisMode if req.analysisMode in ("standard", "fast") else "standard"
+    analysis_mode = req.analysisMode if req.analysisMode in ("standard", "fast", "roots") else "standard"
 
     job = AnalysisJob(
         id=job_id,

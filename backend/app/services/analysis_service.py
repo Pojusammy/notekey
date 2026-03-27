@@ -1,33 +1,17 @@
-"""Melody analysis service — wraps Basic Pitch for note extraction.
+"""Melody and harmonic analysis service — wraps Basic Pitch.
 
-Supports two analysis modes:
+Three analysis modes:
 
 **Standard mode** (default):
-  Conservative filtering tuned for clean, stable melody output.
-  Good for sustained vocals, slow melodies, and general use.
+  Monophonic lead melody extraction with conservative filtering.
 
 **Fast mode** (`analysis_mode="fast"`):
-  Optimised for interludes, runs, syncopation, and quick lead-note
-  passages.  Uses lower thresholds at every pipeline stage so short,
-  valid melodic notes are preserved rather than merged or discarded.
+  Monophonic lead melody tuned for interludes, runs, syncopation.
 
-Pipeline (both modes share the same stages):
-  1. Basic Pitch inference  (onset/frame thresholds + min note length
-     are mode-dependent)
-  2. Pitch-range gating  (C3–C6, configurable)
-  3. Amplitude / confidence filtering
-  4. Minimum-duration gating
-  5. Monophonic melody selection  (onset window is mode-dependent)
-  6. Onset-aware note splitting  (fast mode only)
-  7. **Contour-based pitch refinement**  (NEW — re-estimates pitch from
-     stable middle frames of BP's raw contour output, weighted median,
-     cents-aware quantization, per-note confidence)
-  8. **Octave sanity correction**  (NEW — fixes implausible octave jumps
-     using melodic context)
-  9. Median pitch smoothing  (lighter kernel in fast mode)
- 10. Consecutive-duplicate merging
- 11. Short-note cleanup
- 12. Build clean note + solfa sequence  (confidence now per-note aware)
+**Roots mode** (`analysis_mode="roots"`):
+  Polyphonic harmonic root-note detection.  Analyses all active
+  pitch classes in time windows, matches against chord templates,
+  and returns a cleaned root progression (e.g. C → Am → Dm → G).
 """
 
 import os
@@ -592,7 +576,269 @@ def _build_output(events: list, effective_key: str) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════
+# ── Root-note analysis pipeline (polyphonic) ─────────────────────
+# ══════════════════════════════════════════════════════════════════
+
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# Chord templates: each maps a root pitch-class offset to a set of
+# intervals from the root.  We test all 12 roots × all templates and
+# score by how many active pitch classes match.
+_CHORD_TEMPLATES = {
+    "maj":    {0, 4, 7},
+    "min":    {0, 3, 7},
+    "dom7":   {0, 4, 7, 10},
+    "maj7":   {0, 4, 7, 11},
+    "min7":   {0, 3, 7, 10},
+    "dim":    {0, 3, 6},
+    "aug":    {0, 4, 8},
+    "sus4":   {0, 5, 7},
+    "sus2":   {0, 2, 7},
+    "add9":   {0, 2, 4, 7},
+    "6":      {0, 4, 7, 9},
+    "min6":   {0, 3, 7, 9},
+    "power":  {0, 7},
+}
+
+# Weights: how much a template match is worth (triads > extended)
+_TEMPLATE_WEIGHTS = {
+    "maj": 1.0, "min": 1.0, "dom7": 0.95, "maj7": 0.9, "min7": 0.9,
+    "dim": 0.8, "aug": 0.8, "sus4": 0.75, "sus2": 0.75,
+    "add9": 0.85, "6": 0.85, "min6": 0.85, "power": 0.6,
+}
+
+# Root analysis constants
+_ROOT_HOP = 0.2        # seconds — analysis hop (root estimated every 200 ms)
+_ROOT_WINDOW = 0.35    # seconds — window size to gather active notes
+_ROOT_MIN_SEG = 0.3    # seconds — minimum root segment duration
+_ROOT_AMP_FLOOR = 0.15 # amplitude floor for root analysis (lower than melody)
+_BASS_BONUS = 0.25     # bonus for roots that match the bass note
+
+
+def _collect_pitch_classes(
+    note_events: list,
+    t_start: float,
+    t_end: float,
+) -> tuple[np.ndarray, int | None]:
+    """Collect amplitude-weighted pitch class histogram for a time window.
+
+    Returns (chroma: float[12], bass_pc: int|None).
+    chroma[pc] = sum of amplitudes for that pitch class.
+    bass_pc = pitch class of the lowest-pitched active note (or None).
+    """
+    chroma = np.zeros(12, dtype=float)
+    lowest_midi = 999
+    lowest_pc = None
+
+    for ev in note_events:
+        ev_start = float(ev[0])
+        ev_end = float(ev[1])
+        midi = int(ev[2])
+        amp = float(ev[3])
+
+        # Check overlap with window
+        overlap_start = max(ev_start, t_start)
+        overlap_end = min(ev_end, t_end)
+        if overlap_end <= overlap_start:
+            continue
+
+        # Weight by overlap fraction of the window
+        overlap_frac = (overlap_end - overlap_start) / (t_end - t_start)
+
+        pc = midi % 12
+        chroma[pc] += amp * overlap_frac
+
+        if midi < lowest_midi:
+            lowest_midi = midi
+            lowest_pc = pc
+
+    return chroma, lowest_pc
+
+
+def _best_root(
+    chroma: np.ndarray,
+    bass_pc: int | None,
+) -> tuple[int, float, str]:
+    """Find the root that best explains the active pitch classes.
+
+    Tests all 12 roots against all chord templates.  Scores by:
+      - number of template intervals present (weighted by amplitude)
+      - bonus if root matches bass note
+      - penalty for template intervals that are absent
+
+    Returns (root_pc, confidence, chord_quality).
+    """
+    if chroma.sum() < 1e-6:
+        return 0, 0.0, "maj"
+
+    # Normalise chroma so max = 1
+    norm = chroma / (chroma.max() + 1e-9)
+
+    best_root = 0
+    best_score = -1.0
+    best_quality = "maj"
+
+    for root in range(12):
+        for tpl_name, intervals in _CHORD_TEMPLATES.items():
+            # Score: sum of chroma values at expected intervals
+            hit_energy = 0.0
+            miss_count = 0
+            for iv in intervals:
+                pc = (root + iv) % 12
+                if norm[pc] > 0.08:
+                    hit_energy += norm[pc]
+                else:
+                    miss_count += 1
+
+            if miss_count > len(intervals) // 2:
+                continue  # too many misses
+
+            # Template weight
+            tpl_w = _TEMPLATE_WEIGHTS.get(tpl_name, 0.7)
+            # Coverage: fraction of template intervals that are present
+            coverage = (len(intervals) - miss_count) / len(intervals)
+            score = hit_energy * coverage * tpl_w
+
+            # Bass bonus: if the bass note matches the root
+            if bass_pc is not None and bass_pc == root:
+                score += _BASS_BONUS
+
+            # Root presence bonus: the root pitch class itself should be strong
+            root_strength = norm[root]
+            score += root_strength * 0.15
+
+            if score > best_score:
+                best_score = score
+                best_root = root
+                best_quality = tpl_name
+
+    # Confidence: normalise score roughly to 0–1
+    # A perfect major triad with strong chroma ≈ 3.0 + bass bonus
+    confidence = min(0.99, max(0.1, best_score / 3.5))
+
+    return best_root, confidence, best_quality
+
+
+def _analyze_roots_pipeline(
+    note_events: list,
+    effective_key: str,
+    audio_duration: float,
+) -> dict:
+    """Full root-note analysis pipeline.
+
+    1. Filter note events (wider range, lower amplitude floor)
+    2. Slide a window across time, collecting pitch-class histograms
+    3. For each window, find the best root via chord template matching
+    4. Merge consecutive windows with the same root
+    5. Filter out very short root segments
+    6. Build output in the standard note-sequence format
+    """
+    # Step 1: light filtering (keep polyphonic content, wider range)
+    filtered = []
+    for ev in note_events:
+        amp = float(ev[3])
+        dur = float(ev[1]) - float(ev[0])
+        midi = int(ev[2])
+        if amp >= _ROOT_AMP_FLOOR and dur >= 0.05 and 28 <= midi <= 96:
+            filtered.append(ev)
+
+    if not filtered:
+        return {
+            "noteSequence": [],
+            "solfaSequence": [],
+            "confidenceScore": 0.0,
+        }
+
+    # Step 2–3: windowed root detection
+    raw_roots: list[tuple[float, float, int, float, str]] = []
+    # (start, end, root_pc, confidence, quality)
+
+    t = 0.0
+    while t < audio_duration:
+        w_start = t
+        w_end = min(t + _ROOT_WINDOW, audio_duration)
+
+        chroma, bass_pc = _collect_pitch_classes(filtered, w_start, w_end)
+        root_pc, conf, quality = _best_root(chroma, bass_pc)
+
+        raw_roots.append((w_start, w_end, root_pc, conf, quality))
+        t += _ROOT_HOP
+
+    if not raw_roots:
+        return {
+            "noteSequence": [],
+            "solfaSequence": [],
+            "confidenceScore": 0.0,
+        }
+
+    # Step 4: merge consecutive windows with the same root
+    merged: list[tuple[float, float, int, float, str]] = [raw_roots[0]]
+    for seg in raw_roots[1:]:
+        prev = merged[-1]
+        if seg[2] == prev[2]:
+            # Extend, keep weighted average confidence
+            prev_dur = prev[1] - prev[0]
+            seg_dur = seg[1] - seg[0]
+            total_dur = prev_dur + seg_dur
+            avg_conf = (prev[3] * prev_dur + seg[3] * seg_dur) / total_dur
+            merged[-1] = (prev[0], seg[1], prev[2], avg_conf, prev[4])
+        else:
+            merged.append(seg)
+
+    # Step 5: filter out very short root segments (passing tones)
+    stable: list[tuple[float, float, int, float, str]] = []
+    for seg in merged:
+        dur = seg[1] - seg[0]
+        if dur >= _ROOT_MIN_SEG:
+            stable.append(seg)
+        elif stable:
+            # Absorb short segment into previous
+            prev = stable[-1]
+            stable[-1] = (prev[0], seg[1], prev[2], prev[3], prev[4])
+
+    if not stable:
+        stable = merged[:1] if merged else []
+
+    # Step 6: build output — one "note" per root segment
+    note_sequence = []
+    solfa_sequence = []
+    confidences = []
+
+    for seg in stable:
+        root_pc = seg[2]
+        root_name = _NOTE_NAMES[root_pc]
+        # Use octave 4 as representative (roots are pitch classes, not pitched)
+        midi_repr = 60 + root_pc  # C4 = 60
+        if root_pc > 6:
+            midi_repr = 48 + root_pc  # keep in reasonable range
+        frequency = 440.0 * (2 ** ((midi_repr - 69) / 12))
+        _, octave, _ = frequency_to_note(frequency)
+        solfa = note_to_solfa(root_name, effective_key)
+
+        note_sequence.append({
+            "noteName": root_name,
+            "octave": octave,
+            "startTime": round(seg[0], 3),
+            "duration": round(seg[1] - seg[0], 3),
+            "frequency": round(frequency, 2),
+            "solfa": solfa,
+        })
+        solfa_sequence.append(solfa)
+        confidences.append(seg[3])
+
+    avg_conf = float(np.mean(confidences)) if confidences else 0.0
+
+    return {
+        "noteSequence": note_sequence,
+        "solfaSequence": solfa_sequence,
+        "confidenceScore": round(min(0.99, avg_conf), 3),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
 # ── Public entry point ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 
 def analyze_melody(
     file_path: str,
@@ -606,56 +852,65 @@ def analyze_melody(
     analysis_mode: str = "standard",
 ) -> dict:
     """
-    Analyze a media file and extract the predominant melodic line.
+    Analyze a media file.
 
-    Args:
-        file_path:      Path to the uploaded audio/video file.
-        selected_key:   Global key from the navbar.
-        start_time:     Optional start time (MM:SS or seconds).
-        end_time:       Optional end time (MM:SS or seconds).
-        song_key:       Optional song key override for solfa mapping.
-        starting_note:  Reserved for future post-processing.
-        midi_lo:        Lowest MIDI note to accept (default C3 = 48).
-        midi_hi:        Highest MIDI note to accept (default C6 = 84).
-        analysis_mode:  "standard" (default) or "fast" for interludes/runs.
+    Modes:
+      - "standard" / "fast": monophonic lead melody extraction
+      - "roots": polyphonic harmonic root-note detection
     """
     from basic_pitch.inference import predict
-
-    p = _get_params(analysis_mode)
+    import soundfile as sf
 
     start_secs = parse_time_string(start_time)
     end_secs = parse_time_string(end_time)
-
     wav_path = normalize_audio(file_path, start_secs, end_secs)
 
     try:
-        model_output, _, note_events = predict(
-            wav_path,
-            onset_threshold=p.onset_threshold,
-            frame_threshold=p.frame_threshold,
-            minimum_note_length=p.minimum_note_length,
-        )
-
-        # Extract contour matrix for pitch refinement
-        contour = model_output.get("contour")
-        if contour is not None:
-            contour = np.array(contour)
-        else:
-            contour = np.zeros((1, _BP_N_CONTOUR_BINS))
-
         effective_key = song_key or selected_key or "C"
 
-        # Pipeline
-        step1 = _filter_events(note_events, midi_lo, midi_hi, p)
-        step2 = _select_melody(step1, p)
-        step3 = _onset_split(step2, wav_path, p)
-        step4 = _refine_pitches(step3, contour, p)
-        step5 = _fix_octave_jumps(step4, p)
-        step6 = _smooth_pitches(step5, p)
-        step7 = _merge_consecutive(step6, p)
-        step8 = _cleanup_short_notes(step7, p)
+        if analysis_mode == "roots":
+            # ── Root-note pipeline ──
+            # Use lower thresholds to capture full polyphonic content
+            model_output, _, note_events = predict(
+                wav_path,
+                onset_threshold=0.4,
+                frame_threshold=0.2,
+                minimum_note_length=80.0,
+            )
 
-        return _build_output(step8, effective_key)
+            # Get audio duration for windowing
+            info = sf.info(wav_path)
+            audio_duration = info.duration
+
+            return _analyze_roots_pipeline(note_events, effective_key, audio_duration)
+
+        else:
+            # ── Melody pipeline (standard / fast) ──
+            p = _get_params(analysis_mode)
+
+            model_output, _, note_events = predict(
+                wav_path,
+                onset_threshold=p.onset_threshold,
+                frame_threshold=p.frame_threshold,
+                minimum_note_length=p.minimum_note_length,
+            )
+
+            contour = model_output.get("contour")
+            if contour is not None:
+                contour = np.array(contour)
+            else:
+                contour = np.zeros((1, _BP_N_CONTOUR_BINS))
+
+            step1 = _filter_events(note_events, midi_lo, midi_hi, p)
+            step2 = _select_melody(step1, p)
+            step3 = _onset_split(step2, wav_path, p)
+            step4 = _refine_pitches(step3, contour, p)
+            step5 = _fix_octave_jumps(step4, p)
+            step6 = _smooth_pitches(step5, p)
+            step7 = _merge_consecutive(step6, p)
+            step8 = _cleanup_short_notes(step7, p)
+
+            return _build_output(step8, effective_key)
     finally:
         if os.path.exists(wav_path):
             os.unlink(wav_path)
