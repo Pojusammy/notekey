@@ -24,7 +24,8 @@ router = APIRouter(prefix="/api", tags=["analysis"])
 
 def _run_analysis_sync(job_id: str, file_url: str, selected_key: str,
                        start_time: str | None, end_time: str | None,
-                       song_key: str | None, starting_note: str | None) -> dict:
+                       song_key: str | None, starting_note: str | None,
+                       analysis_mode: str = "standard") -> dict:
     """Run the CPU-heavy analysis in a sync context (called via to_thread)."""
     local_path = download_to_tempfile(file_url)
     try:
@@ -35,6 +36,7 @@ def _run_analysis_sync(job_id: str, file_url: str, selected_key: str,
             end_time=end_time,
             song_key=song_key,
             starting_note=starting_note,
+            analysis_mode=analysis_mode,
         )
     finally:
         if not is_local_path(file_url):
@@ -46,7 +48,8 @@ def _run_analysis_sync(job_id: str, file_url: str, selected_key: str,
 
 async def _process_job(job_id: str, file_url: str, selected_key: str,
                        start_time: str | None, end_time: str | None,
-                       song_key: str | None, starting_note: str | None):
+                       song_key: str | None, starting_note: str | None,
+                       analysis_mode: str = "standard"):
     """Background task: update status, run analysis, persist results."""
     async with async_session() as db:
         # Mark processing
@@ -61,7 +64,7 @@ async def _process_job(job_id: str, file_url: str, selected_key: str,
         # Run CPU-bound work in a thread so we don't block the event loop
         result_data = await asyncio.to_thread(
             _run_analysis_sync, job_id, file_url, selected_key,
-            start_time, end_time, song_key, starting_note,
+            start_time, end_time, song_key, starting_note, analysis_mode,
         )
 
         async with async_session() as db:
@@ -93,6 +96,8 @@ async def _process_job(job_id: str, file_url: str, selected_key: str,
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)):
     job_id = uuid.uuid4()
+    analysis_mode = req.analysisMode if req.analysisMode in ("standard", "fast") else "standard"
+
     job = AnalysisJob(
         id=job_id,
         job_type="recording_analysis",
@@ -102,6 +107,7 @@ async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)
         end_time=req.endTime,
         song_key=req.songKey,
         starting_note=req.startingNote,
+        analysis_mode=analysis_mode,
         status="pending",
     )
     db.add(job)
@@ -111,6 +117,7 @@ async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)
     asyncio.create_task(_process_job(
         str(job_id), req.fileUrl, req.selectedKey,
         req.startTime, req.endTime, req.songKey, req.startingNote,
+        analysis_mode,
     ))
 
     return AnalyzeResponse(jobId=str(job_id))

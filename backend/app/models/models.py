@@ -36,6 +36,7 @@ class AnalysisJob(Base):
     end_time = Column(String(20), nullable=True)
     song_key = Column(String(10), nullable=True)
     starting_note = Column(String(10), nullable=True)
+    analysis_mode = Column(String(20), nullable=False, default="standard")
     status = Column(
         Enum("pending", "processing", "completed", "failed", name="job_status_enum"),
         nullable=False,

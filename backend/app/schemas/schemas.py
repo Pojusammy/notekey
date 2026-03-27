@@ -18,6 +18,7 @@ class AnalyzeRequest(BaseModel):
     endTime: str | None = None
     songKey: str | None = None
     startingNote: str | None = None
+    analysisMode: str = "standard"  # "standard" or "fast"
 
 
 class AnalyzeResponse(BaseModel):
