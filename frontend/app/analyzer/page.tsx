@@ -445,15 +445,29 @@ export default function AnalyzerPage() {
   );
 }
 
-/** Group a flat note sequence into phrases of 4–6 notes */
+/** Group a flat note sequence into phrases based on time gaps */
 function groupIntoPhrases(notes: NoteEvent[]): NoteEvent[][] {
+  if (notes.length === 0) return [];
+
+  // Sort by start time (ascending) to ensure chronological order
+  const sorted = [...notes].sort((a, b) => a.startTime - b.startTime);
+
+  const GAP_THRESHOLD = 0.3; // 300ms gap = new phrase
+  const MAX_PHRASE = 8;      // max notes per phrase
+
   const phrases: NoteEvent[][] = [];
-  let chunk: NoteEvent[] = [];
-  for (const n of notes) {
-    chunk.push(n);
-    if (chunk.length >= 4 + Math.floor(Math.random() * 3)) {
+  let chunk: NoteEvent[] = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const curr = sorted[i];
+    const gap = curr.startTime - (prev.startTime + prev.duration);
+
+    if (gap >= GAP_THRESHOLD || chunk.length >= MAX_PHRASE) {
       phrases.push(chunk);
-      chunk = [];
+      chunk = [curr];
+    } else {
+      chunk.push(curr);
     }
   }
   if (chunk.length > 0) phrases.push(chunk);
