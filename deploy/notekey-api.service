@@ -1,0 +1,22 @@
+[Unit]
+Description=NoteKey API (FastAPI + Gunicorn)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+User=notekey
+Group=notekey
+WorkingDirectory=/opt/notekey/backend
+EnvironmentFile=/opt/notekey/backend/.env
+ExecStart=/opt/notekey/venv/bin/gunicorn app.main:app \
+    -k uvicorn.workers.UvicornWorker \
+    --bind 127.0.0.1:8000 \
+    --workers 2 \
+    --timeout 300 \
+    --access-logfile - \
+    --error-logfile -
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

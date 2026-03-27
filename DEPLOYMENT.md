@@ -1,29 +1,26 @@
 # NoteKey — Deployment Guide
 
-Production stack: **Vercel** (frontend) + **Render** (backend + worker) + **Supabase** (Postgres + Storage) + **Render Redis** or **Upstash**.
+Production stack: **Vercel** (frontend) + **Oracle Cloud Always Free VM** (backend) + **Supabase** (Postgres + Storage).
+
+No Redis, no Celery — background analysis jobs run via `asyncio.create_task` inside the FastAPI process.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────┐     HTTPS      ┌─────────────────┐
-│   Vercel     │ ──────────────▶│  Render: API     │
-│  (Next.js)   │  BACKEND_URL   │  (FastAPI)       │
-└─────────────┘                └────────┬────────┘
-                                        │ Celery task
-                                        ▼
-                               ┌─────────────────┐
-                               │  Render: Worker  │
-                               │  (Celery)        │
-                               └────────┬────────┘
-                                        │
-                        ┌───────────────┼───────────────┐
-                        ▼               ▼               ▼
-                ┌──────────┐   ┌──────────────┐  ┌──────────┐
-                │ Supabase │   │   Supabase   │  │  Redis   │
-                │ Postgres │   │   Storage    │  │ (Render) │
-                └──────────┘   └──────────────┘  └──────────┘
+┌─────────────┐     HTTPS      ┌──────────────────────┐
+│   Vercel     │ ──────────────▶│  Oracle VM           │
+│  (Next.js)   │  BACKEND_URL   │  Nginx → Gunicorn    │
+└─────────────┘                │  (FastAPI + Uvicorn)  │
+                               └──────────┬───────────┘
+                                          │
+                          ┌───────────────┴───────────────┐
+                          ▼                               ▼
+                  ┌──────────────┐               ┌──────────────┐
+                  │   Supabase   │               │   Supabase   │
+                  │   Postgres   │               │   Storage    │
+                  └──────────────┘               └──────────────┘
 ```
 
 ---
@@ -36,79 +33,63 @@ Production stack: **Vercel** (frontend) + **Render** (backend + worker) + **Supa
 2. Go to **Settings → Database** and copy the connection string
 3. Format for the backend:
    ```
-   # Async (FastAPI)
    postgresql+asyncpg://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
-
-   # Sync (Celery) — the app auto-converts +asyncpg to +psycopg2
    ```
 
 ### Storage
 
 1. Go to **Storage** in your Supabase dashboard
-2. Create a new bucket called `uploads`
-3. Set it to **private** (the backend uses the service role key)
-4. Go to **Settings → API** and copy:
+2. Create a bucket called `uploads` (set to **private**)
+3. Go to **Settings → API** and copy:
    - `Project URL` → `SUPABASE_URL`
    - `service_role` key → `SUPABASE_SERVICE_KEY` (NOT the `anon` key)
 
 ---
 
-## 2. Redis Setup
+## 2. Oracle Cloud VM Setup
 
-### Option A: Render Redis
+### Create the VM
 
-1. In your Render dashboard, add a **Redis** service
-2. Copy the **Internal URL** for use by the API and worker
-3. Use the same URL for both `REDIS_URL` and `CELERY_BROKER_URL`
+1. Sign up for [Oracle Cloud Always Free](https://www.oracle.com/cloud/free/)
+2. Create an **Ampere A1** instance (ARM, 4 OCPU / 24 GB RAM — Always Free eligible)
+   - OS: Ubuntu 22.04 or 24.04
+3. Open ports **80** and **443** in the VCN security list (ingress rules)
 
-### Option B: Upstash Redis
+### Install System Dependencies
 
-1. Create a database at [upstash.com](https://upstash.com)
-2. Copy the `redis://...` connection string
-3. Use for `REDIS_URL`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND`
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y python3.11 python3.11-venv python3-pip \
+    nginx certbot python3-certbot-nginx ffmpeg git
+```
 
----
+### Deploy the Backend
 
-## 3. Render Setup (Backend + Worker)
+```bash
+# Create service user
+sudo useradd -r -s /bin/false notekey
+sudo mkdir -p /opt/notekey
+sudo chown notekey:notekey /opt/notekey
 
-### Option A: Deploy via render.yaml (recommended)
+# Clone repo and set up venv
+sudo -u notekey git clone https://github.com/YOUR_USER/note-keys.git /opt/notekey
+cd /opt/notekey/backend
+sudo -u notekey python3.11 -m venv /opt/notekey/venv
+sudo -u notekey /opt/notekey/venv/bin/pip install --no-cache-dir -r requirements.txt
+```
 
-1. Push this repo to GitHub
-2. In Render, click **New → Blueprint**
-3. Connect the repo — Render reads `render.yaml` and creates all services
-4. Fill in the env vars when prompted
+### Configure Environment
 
-### Option B: Manual setup
+```bash
+sudo -u notekey cp /opt/notekey/backend/.env.example /opt/notekey/backend/.env
+sudo -u notekey nano /opt/notekey/backend/.env
+```
 
-#### API Service
+Set these values in `.env`:
 
-1. **New → Web Service** → connect your repo
-2. Settings:
-   - **Root Directory**: `backend`
-   - **Runtime**: Python 3
-   - **Build Command**: `./render-build.sh`
-   - **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-
-#### Worker Service
-
-1. **New → Background Worker** → connect your repo
-2. Settings:
-   - **Root Directory**: `backend`
-   - **Runtime**: Python 3
-   - **Build Command**: `./render-build.sh`
-   - **Start Command**: `celery -A app.core.celery_app worker --loglevel=info --concurrency=2`
-
-### Environment Variables (both services)
-
-Set these on **both** the API and Worker services:
-
-| Variable | Example | Notes |
-|----------|---------|-------|
-| `PYTHON_VERSION` | `3.11.9` | Must be 3.11.x (TensorFlow constraint) |
+| Variable | Value | Notes |
+|----------|-------|-------|
 | `DATABASE_URL` | `postgresql+asyncpg://...` | From Supabase |
-| `REDIS_URL` | `redis://...` | From Render Redis or Upstash |
-| `CELERY_BROKER_URL` | `redis://...` | Same as REDIS_URL (or different DB number) |
-| `CELERY_RESULT_BACKEND` | `redis://...` | Same as CELERY_BROKER_URL |
 | `STORAGE_BACKEND` | `supabase` | Use `supabase` for production |
 | `SUPABASE_URL` | `https://xxx.supabase.co` | From Supabase dashboard |
 | `SUPABASE_SERVICE_KEY` | `eyJ...` | Service role key (NOT anon) |
@@ -116,55 +97,88 @@ Set these on **both** the API and Worker services:
 | `CORS_ORIGINS` | `["https://your-app.vercel.app"]` | Your Vercel domain |
 | `DEBUG` | `false` | |
 
-> Render provides `$PORT` automatically — do not set it manually.
+### Install systemd Service
 
-### FFmpeg on Render
+```bash
+sudo cp /opt/notekey/deploy/notekey-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now notekey-api
+sudo systemctl status notekey-api
+```
 
-Render's Python runtime includes FFmpeg by default. No extra setup needed.
+### Install Nginx Config
+
+```bash
+# Copy and edit the config (replace your-domain.com)
+sudo cp /opt/notekey/deploy/notekey-nginx.conf /etc/nginx/sites-available/notekey
+sudo ln -s /etc/nginx/sites-available/notekey /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+
+# Test and reload
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### Set Up SSL (Let's Encrypt)
+
+```bash
+sudo certbot --nginx -d your-domain.com
+```
+
+Certbot will auto-renew via systemd timer.
 
 ---
 
-## 4. Vercel Setup (Frontend)
+## 3. Vercel Setup (Frontend)
 
-1. In Vercel, import the repo
+1. Import the repo in Vercel
 2. Set **Root Directory** to `frontend`
 3. Framework: Next.js (auto-detected)
 4. Add environment variable:
 
 | Variable | Value |
 |----------|-------|
-| `BACKEND_URL` | `https://notekey-api.onrender.com` (your Render API URL) |
+| `BACKEND_URL` | `https://your-domain.com` (your Oracle VM domain) |
 
 5. Deploy
 
 ### How it works
 
-The Next.js API routes (`/api/upload`, `/api/analyze`, `/api/jobs/[id]`, `/api/results/[id]`) proxy all requests to the Python backend using `BACKEND_URL`. If the backend is unreachable, they fall back to a local JS analysis (limited accuracy).
+The Next.js API routes (`/api/upload`, `/api/analyze`, `/api/jobs/[id]`, `/api/results/[id]`) proxy all requests to the Python backend using `BACKEND_URL`.
 
 ---
 
-## 5. Verify Deployment
-
-After all services are deployed:
+## 4. Verify Deployment
 
 ```bash
 # 1. Health check
-curl https://notekey-api.onrender.com/health
+curl https://your-domain.com/health
 
 # 2. Test upload
-curl -X POST https://notekey-api.onrender.com/api/upload \
+curl -X POST https://your-domain.com/api/upload \
   -F "file=@test.wav"
 
 # 3. Test analysis
-curl -X POST https://notekey-api.onrender.com/api/analyze \
+curl -X POST https://your-domain.com/api/analyze \
   -H "Content-Type: application/json" \
   -d '{"fileUrl":"<fileUrl from step 2>","selectedKey":"C"}'
 
 # 4. Check job status
-curl https://notekey-api.onrender.com/api/jobs/<jobId>
+curl https://your-domain.com/api/jobs/<jobId>
 
 # 5. Get results
-curl https://notekey-api.onrender.com/api/results/<jobId>
+curl https://your-domain.com/api/results/<jobId>
+```
+
+---
+
+## 5. Updating the Backend
+
+```bash
+cd /opt/notekey
+sudo -u notekey git pull
+sudo -u notekey /opt/notekey/venv/bin/pip install -r backend/requirements.txt
+sudo systemctl restart notekey-api
 ```
 
 ---
@@ -177,25 +191,33 @@ Docker Compose is still available for local development:
 docker compose up --build
 ```
 
-This starts Postgres, Redis, the API, and the worker locally. No Supabase or Render needed.
+This starts Postgres and the API locally. No Supabase needed.
 
 To develop without Docker:
 
 ```bash
 # Terminal 1: API
 cd backend
-cp .env.example .env  # edit with local Postgres/Redis URLs
+cp .env.example .env  # edit with local Postgres URL
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-# Terminal 2: Worker
-cd backend
-celery -A app.core.celery_app worker --loglevel=info
-
-# Terminal 3: Frontend
+# Terminal 2: Frontend
 cd frontend
 BACKEND_URL=http://localhost:8000 npm run dev
 ```
+
+---
+
+## Cost Summary
+
+| Service | Cost |
+|---------|------|
+| Oracle Cloud VM (A1 Ampere) | **Free** (Always Free tier) |
+| Supabase (Postgres + Storage) | **Free** (Free tier: 500 MB DB, 1 GB storage) |
+| Vercel (Frontend) | **Free** (Hobby plan) |
+| Domain + SSL | ~$10/year (domain) + Free (Let's Encrypt) |
+| **Total** | **~$0–10/year** |
 
 ---
 
@@ -203,9 +225,10 @@ BACKEND_URL=http://localhost:8000 npm run dev
 
 | Issue | Fix |
 |-------|-----|
-| `ResolutionImpossible` on build | Ensure `PYTHON_VERSION=3.11.9` — TensorFlow needs Python 3.11 |
-| Worker not processing tasks | Check Redis connectivity and that both services share the same `CELERY_BROKER_URL` |
-| Upload fails with 500 | Verify `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, and that the `uploads` bucket exists |
-| CORS errors on frontend | Add your Vercel domain to `CORS_ORIGINS` on the API service |
-| FFmpeg not found | Render includes it by default; if using a custom image, install `ffmpeg` |
-| Cold start latency on Render | First request after idle may take 30-60s on the free/starter plan |
+| `ResolutionImpossible` on pip install | Ensure Python 3.11 — TensorFlow/Basic Pitch needs 3.11 |
+| Analysis hangs or times out | Check gunicorn `--timeout 300` and nginx `proxy_read_timeout` |
+| Upload fails with 500 | Verify `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, bucket exists |
+| CORS errors on frontend | Add your Vercel domain to `CORS_ORIGINS` |
+| FFmpeg not found | `sudo apt install ffmpeg` |
+| VM not reachable on 80/443 | Check Oracle VCN security list AND `iptables` rules |
+| Service won't start | `journalctl -u notekey-api -f` for logs |

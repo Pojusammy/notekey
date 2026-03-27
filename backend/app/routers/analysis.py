@@ -1,11 +1,14 @@
+import asyncio
+import os
 import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, async_session
+from app.core.storage import download_to_tempfile, is_local_path
 from app.models.models import AnalysisJob, AnalysisResult
 from app.schemas.schemas import (
     AnalyzeRequest,
@@ -14,15 +17,84 @@ from app.schemas.schemas import (
     AnalysisResultResponse,
     NoteEventOut,
 )
-from app.workers.tasks import process_analysis
+from app.services.analysis_service import analyze_melody
 
 router = APIRouter(prefix="/api", tags=["analysis"])
 
 
+def _run_analysis_sync(job_id: str, file_url: str, selected_key: str,
+                       start_time: str | None, end_time: str | None,
+                       song_key: str | None, starting_note: str | None) -> dict:
+    """Run the CPU-heavy analysis in a sync context (called via to_thread)."""
+    local_path = download_to_tempfile(file_url)
+    try:
+        return analyze_melody(
+            file_path=local_path,
+            selected_key=selected_key,
+            start_time=start_time,
+            end_time=end_time,
+            song_key=song_key,
+            starting_note=starting_note,
+        )
+    finally:
+        if not is_local_path(file_url):
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
+
+
+async def _process_job(job_id: str, file_url: str, selected_key: str,
+                       start_time: str | None, end_time: str | None,
+                       song_key: str | None, starting_note: str | None):
+    """Background task: update status, run analysis, persist results."""
+    async with async_session() as db:
+        # Mark processing
+        await db.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(status="processing")
+        )
+        await db.commit()
+
+    try:
+        # Run CPU-bound work in a thread so we don't block the event loop
+        result_data = await asyncio.to_thread(
+            _run_analysis_sync, job_id, file_url, selected_key,
+            start_time, end_time, song_key, starting_note,
+        )
+
+        async with async_session() as db:
+            analysis_result = AnalysisResult(
+                id=uuid.uuid4(),
+                job_id=job_id,
+                raw_note_sequence=result_data["noteSequence"],
+                solfa_sequence=result_data["solfaSequence"],
+                confidence_score=result_data["confidenceScore"],
+            )
+            db.add(analysis_result)
+            await db.execute(
+                update(AnalysisJob)
+                .where(AnalysisJob.id == job_id)
+                .values(status="completed", completed_at=datetime.utcnow())
+            )
+            await db.commit()
+
+    except Exception as exc:
+        async with async_session() as db:
+            await db.execute(
+                update(AnalysisJob)
+                .where(AnalysisJob.id == job_id)
+                .values(status="failed", error_message=str(exc)[:500])
+            )
+            await db.commit()
+
+
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)):
+    job_id = uuid.uuid4()
     job = AnalysisJob(
-        id=uuid.uuid4(),
+        id=job_id,
         job_type="recording_analysis",
         input_file_url=req.fileUrl,
         selected_key=req.selectedKey,
@@ -35,10 +107,13 @@ async def start_analysis(req: AnalyzeRequest, db: AsyncSession = Depends(get_db)
     db.add(job)
     await db.commit()
 
-    # Dispatch Celery task
-    process_analysis.delay(str(job.id))
+    # Fire-and-forget background processing (no Celery/Redis needed)
+    asyncio.create_task(_process_job(
+        str(job_id), req.fileUrl, req.selectedKey,
+        req.startTime, req.endTime, req.songKey, req.startingNote,
+    ))
 
-    return AnalyzeResponse(jobId=str(job.id))
+    return AnalyzeResponse(jobId=str(job_id))
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)

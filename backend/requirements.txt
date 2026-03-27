@@ -5,8 +5,7 @@ sqlalchemy==2.0.36
 alembic==1.14.1
 asyncpg==0.30.0
 psycopg2-binary==2.9.10
-celery[redis]==5.4.0
-redis==5.2.1
+gunicorn==22.0.0
 librosa==0.10.2.post1
 basic-pitch>=0.3.0
 numpy<2

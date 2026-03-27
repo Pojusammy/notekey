@@ -1,5 +1,3 @@
-import os
-
 from pydantic_settings import BaseSettings
 
 
@@ -7,18 +5,10 @@ class Settings(BaseSettings):
     # App
     APP_NAME: str = "NoteKey API"
     DEBUG: bool = False
-    API_PREFIX: str = "/api"
     PORT: int = 8000
 
     # Database (Supabase Postgres or any Postgres)
     DATABASE_URL: str = "postgresql+asyncpg://notekey:notekey@localhost:5432/notekey"
-
-    # Redis (Render Redis or Upstash)
-    REDIS_URL: str = "redis://localhost:6379/0"
-
-    # Celery
-    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
-    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
 
     # Storage — "local" for dev, "supabase" for production
     STORAGE_BACKEND: str = "local"
