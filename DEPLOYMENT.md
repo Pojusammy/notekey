@@ -1,33 +1,35 @@
 # NoteKey — Deployment Guide
 
-Production stack: **Vercel** (frontend) + **Oracle Cloud Always Free VM** (backend) + **Supabase** (Postgres + Storage).
+Production stack: **Vercel** (Next.js frontend) + **Oracle Cloud Always Free VM** (FastAPI backend) + **Supabase** (Postgres + Storage).
 
-No Redis, no Celery — background analysis jobs run via `asyncio.create_task` inside the FastAPI process.
+No Redis, no Celery, no Docker in production — background analysis runs via `asyncio.create_task` inside the FastAPI process.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────┐     HTTPS      ┌──────────────────────┐
-│   Vercel     │ ──────────────▶│  Oracle VM           │
-│  (Next.js)   │  BACKEND_URL   │  Nginx → Gunicorn    │
-└─────────────┘                │  (FastAPI + Uvicorn)  │
-                               └──────────┬───────────┘
-                                          │
-                          ┌───────────────┴───────────────┐
-                          ▼                               ▼
-                  ┌──────────────┐               ┌──────────────┐
-                  │   Supabase   │               │   Supabase   │
-                  │   Postgres   │               │   Storage    │
-                  └──────────────┘               └──────────────┘
+┌────────────────────┐        HTTPS        ┌────────────────────────┐
+│  Vercel             │ ──────────────────▶ │  Oracle Cloud VM       │
+│  Next.js frontend   │    BACKEND_URL      │  Nginx → Gunicorn      │
+│  (Preview + Prod)   │                     │  (FastAPI + Uvicorn)   │
+└────────────────────┘                     └───────────┬────────────┘
+                                                       │
+                                       ┌───────────────┴──────────────┐
+                                       ▼                              ▼
+                               ┌──────────────┐              ┌──────────────┐
+                               │   Supabase   │              │   Supabase   │
+                               │   Postgres   │              │   Storage    │
+                               └──────────────┘              └──────────────┘
 ```
+
+**How the proxy works:** The Next.js API routes (`/api/upload`, `/api/analyze`, `/api/jobs/[id]`, `/api/results/[id]`, `/api/history`) proxy requests to the Python backend using the `BACKEND_URL` environment variable. If the backend is unreachable, they fall back to local JS-based analysis.
 
 ---
 
 ## 1. Supabase Setup
 
-### Database (Postgres)
+### Postgres
 
 1. Create a project at [supabase.com](https://supabase.com)
 2. Go to **Settings → Database** and copy the connection string
@@ -38,9 +40,8 @@ No Redis, no Celery — background analysis jobs run via `asyncio.create_task` i
 
 ### Storage
 
-1. Go to **Storage** in your Supabase dashboard
-2. Create a bucket called `uploads` (set to **private**)
-3. Go to **Settings → API** and copy:
+1. Go to **Storage** → create a bucket called `uploads` (set to **private**)
+2. Go to **Settings → API** and copy:
    - `Project URL` → `SUPABASE_URL`
    - `service_role` key → `SUPABASE_SERVICE_KEY` (NOT the `anon` key)
 
@@ -54,120 +55,109 @@ No Redis, no Celery — background analysis jobs run via `asyncio.create_task` i
 2. Create an **Ampere A1** instance (ARM, 4 OCPU / 24 GB RAM — Always Free eligible)
    - OS: Ubuntu 22.04 or 24.04
 3. Open ports **80** and **443** in the VCN security list (ingress rules)
+4. Point your domain's A record to the VM's public IP
 
-### Install System Dependencies
+### Automated Setup
 
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y python3.11 python3.11-venv python3-pip \
-    nginx certbot python3-certbot-nginx ffmpeg git
-```
-
-### Deploy the Backend
+SSH into the VM and run:
 
 ```bash
-# Create service user
-sudo useradd -r -s /bin/false notekey
-sudo mkdir -p /opt/notekey
-sudo chown notekey:notekey /opt/notekey
-
-# Clone repo and set up venv
-sudo -u notekey git clone https://github.com/YOUR_USER/note-keys.git /opt/notekey
-cd /opt/notekey/backend
-sudo -u notekey python3.11 -m venv /opt/notekey/venv
-sudo -u notekey /opt/notekey/venv/bin/pip install --no-cache-dir -r requirements.txt
+git clone https://github.com/Pojusammy/notekey.git /tmp/notekey-setup
+sudo bash /tmp/notekey-setup/deploy/setup.sh \
+    https://github.com/Pojusammy/notekey.git \
+    api.your-domain.com
 ```
+
+This installs all system dependencies, creates the Python venv, configures systemd + Nginx, and prepares the `.env` file.
 
 ### Configure Environment
 
 ```bash
-sudo -u notekey cp /opt/notekey/backend/.env.example /opt/notekey/backend/.env
 sudo -u notekey nano /opt/notekey/backend/.env
 ```
 
-Set these values in `.env`:
+Set these production values:
 
 | Variable | Value | Notes |
 |----------|-------|-------|
+| `DEBUG` | `false` | |
 | `DATABASE_URL` | `postgresql+asyncpg://...` | From Supabase |
-| `STORAGE_BACKEND` | `supabase` | Use `supabase` for production |
+| `STORAGE_BACKEND` | `supabase` | |
 | `SUPABASE_URL` | `https://xxx.supabase.co` | From Supabase dashboard |
 | `SUPABASE_SERVICE_KEY` | `eyJ...` | Service role key (NOT anon) |
-| `SUPABASE_BUCKET` | `uploads` | Bucket name you created |
-| `CORS_ORIGINS` | `["https://your-app.vercel.app"]` | Your Vercel domain |
-| `DEBUG` | `false` | |
+| `SUPABASE_BUCKET` | `uploads` | |
+| `CORS_ORIGINS` | `["https://notekey.vercel.app"]` | Your Vercel production domain |
+| `CORS_ORIGIN_REGEX` | `https://.*\.vercel\.app` | Auto-allows all Vercel preview URLs |
 
-### Install systemd Service
-
-```bash
-sudo cp /opt/notekey/deploy/notekey-api.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now notekey-api
-sudo systemctl status notekey-api
-```
-
-### Install Nginx Config
+### Start the API
 
 ```bash
-# Copy and edit the config (replace your-domain.com)
-sudo cp /opt/notekey/deploy/notekey-nginx.conf /etc/nginx/sites-available/notekey
-sudo ln -s /etc/nginx/sites-available/notekey /etc/nginx/sites-enabled/
-sudo rm /etc/nginx/sites-enabled/default
-
-# Test and reload
-sudo nginx -t
-sudo systemctl reload nginx
+sudo systemctl start notekey-api
+sudo systemctl status notekey-api   # should show "active (running)"
+curl http://localhost:8000/health    # {"status":"ok","service":"NoteKey API"}
 ```
 
-### Set Up SSL (Let's Encrypt)
+### SSL (Let's Encrypt)
 
 ```bash
-sudo certbot --nginx -d your-domain.com
+sudo certbot --nginx -d api.your-domain.com
 ```
 
-Certbot will auto-renew via systemd timer.
+Certbot auto-renews via systemd timer. After SSL:
+
+```bash
+curl https://api.your-domain.com/health
+```
 
 ---
 
 ## 3. Vercel Setup (Frontend)
 
-1. Import the repo in Vercel
-2. Set **Root Directory** to `frontend`
-3. Framework: Next.js (auto-detected)
-4. Add environment variable:
+### Import the repo
 
-| Variable | Value |
-|----------|-------|
-| `BACKEND_URL` | `https://your-domain.com` (your Oracle VM domain) |
+1. Go to [vercel.com](https://vercel.com) → **Add New → Project**
+2. Import the GitHub repo
+3. Set **Root Directory** to `frontend`
+4. Framework: Next.js (auto-detected)
 
-5. Deploy
+### Environment Variables
 
-### How it works
+Set `BACKEND_URL` in Vercel project settings → **Environment Variables**:
 
-The Next.js API routes (`/api/upload`, `/api/analyze`, `/api/jobs/[id]`, `/api/results/[id]`) proxy all requests to the Python backend using `BACKEND_URL`.
+| Environment | Variable | Value |
+|-------------|----------|-------|
+| Production | `BACKEND_URL` | `https://api.your-domain.com` |
+| Preview | `BACKEND_URL` | `https://api.your-domain.com` |
+| Development | `BACKEND_URL` | `http://localhost:8000` |
+
+Both Preview and Production point to the same Oracle VM backend. The backend's `CORS_ORIGIN_REGEX` (`https://.*\.vercel\.app`) automatically allows all Vercel preview URLs.
+
+### Deploy
+
+Push to `main` for production. Push to any other branch (or open a PR) for a preview deployment.
 
 ---
 
-## 4. Verify Deployment
+## 4. Verify End-to-End
 
 ```bash
-# 1. Health check
-curl https://your-domain.com/health
+# 1. Backend health
+curl https://api.your-domain.com/health
 
-# 2. Test upload
-curl -X POST https://your-domain.com/api/upload \
+# 2. Upload a file
+curl -X POST https://api.your-domain.com/api/upload \
   -F "file=@test.wav"
 
-# 3. Test analysis
-curl -X POST https://your-domain.com/api/analyze \
+# 3. Start analysis
+curl -X POST https://api.your-domain.com/api/analyze \
   -H "Content-Type: application/json" \
   -d '{"fileUrl":"<fileUrl from step 2>","selectedKey":"C"}'
 
-# 4. Check job status
-curl https://your-domain.com/api/jobs/<jobId>
+# 4. Poll job status
+curl https://api.your-domain.com/api/jobs/<jobId>
 
 # 5. Get results
-curl https://your-domain.com/api/results/<jobId>
+curl https://api.your-domain.com/api/results/<jobId>
 ```
 
 ---
@@ -175,6 +165,7 @@ curl https://your-domain.com/api/results/<jobId>
 ## 5. Updating the Backend
 
 ```bash
+ssh your-vm
 cd /opt/notekey
 sudo -u notekey git pull
 sudo -u notekey /opt/notekey/venv/bin/pip install -r backend/requirements.txt
@@ -183,28 +174,28 @@ sudo systemctl restart notekey-api
 
 ---
 
-## Local Development (with Docker)
+## Local Development
 
-Docker Compose is still available for local development:
+### With Docker (Postgres only, no Redis)
 
 ```bash
 docker compose up --build
 ```
 
-This starts Postgres and the API locally. No Supabase needed.
+Starts Postgres + the API locally. No Supabase needed.
 
-To develop without Docker:
+### Without Docker
 
 ```bash
-# Terminal 1: API
+# Terminal 1: Backend
 cd backend
-cp .env.example .env  # edit with local Postgres URL
+cp .env.example .env   # edit DATABASE_URL if needed
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 # Terminal 2: Frontend
 cd frontend
-BACKEND_URL=http://localhost:8000 npm run dev
+npm run dev   # reads BACKEND_URL from .env.local
 ```
 
 ---
@@ -213,10 +204,10 @@ BACKEND_URL=http://localhost:8000 npm run dev
 
 | Service | Cost |
 |---------|------|
-| Oracle Cloud VM (A1 Ampere) | **Free** (Always Free tier) |
-| Supabase (Postgres + Storage) | **Free** (Free tier: 500 MB DB, 1 GB storage) |
-| Vercel (Frontend) | **Free** (Hobby plan) |
-| Domain + SSL | ~$10/year (domain) + Free (Let's Encrypt) |
+| Oracle Cloud VM (A1 Ampere, 4 OCPU / 24 GB) | **Free** (Always Free tier) |
+| Supabase (Postgres + Storage) | **Free** (500 MB DB, 1 GB storage) |
+| Vercel (Next.js frontend) | **Free** (Hobby plan) |
+| Domain + SSL | ~$10/year domain + Free (Let's Encrypt) |
 | **Total** | **~$0–10/year** |
 
 ---
@@ -225,10 +216,11 @@ BACKEND_URL=http://localhost:8000 npm run dev
 
 | Issue | Fix |
 |-------|-----|
-| `ResolutionImpossible` on pip install | Ensure Python 3.11 — TensorFlow/Basic Pitch needs 3.11 |
+| `ResolutionImpossible` on pip install | Ensure Python 3.11 — TensorFlow/Basic Pitch needs it |
 | Analysis hangs or times out | Check gunicorn `--timeout 300` and nginx `proxy_read_timeout` |
 | Upload fails with 500 | Verify `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, bucket exists |
-| CORS errors on frontend | Add your Vercel domain to `CORS_ORIGINS` |
+| CORS errors from Vercel preview | Check `CORS_ORIGIN_REGEX` is set to `https://.*\.vercel\.app` |
 | FFmpeg not found | `sudo apt install ffmpeg` |
-| VM not reachable on 80/443 | Check Oracle VCN security list AND `iptables` rules |
+| VM not reachable on 80/443 | Check Oracle VCN security list AND `sudo iptables -L` |
 | Service won't start | `journalctl -u notekey-api -f` for logs |
+| ARM pip install fails | Some packages need build tools: `sudo apt install build-essential` |

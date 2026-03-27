@@ -24,6 +24,8 @@ class Settings(BaseSettings):
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+    # Regex for Vercel preview URLs — matches *.vercel.app automatically
+    CORS_ORIGIN_REGEX: str = r"https://.*\.vercel\.app"
 
     class Config:
         env_file = ".env"
