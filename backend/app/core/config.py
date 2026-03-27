@@ -1,29 +1,33 @@
+import os
+
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     # App
     APP_NAME: str = "NoteKey API"
-    DEBUG: bool = True
+    DEBUG: bool = False
     API_PREFIX: str = "/api"
+    PORT: int = 8000
 
-    # Database
+    # Database (Supabase Postgres or any Postgres)
     DATABASE_URL: str = "postgresql+asyncpg://notekey:notekey@localhost:5432/notekey"
 
-    # Redis
+    # Redis (Render Redis or Upstash)
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # Celery
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
 
-    # Storage
-    STORAGE_BACKEND: str = "local"  # "local" or "s3"
+    # Storage — "local" for dev, "supabase" for production
+    STORAGE_BACKEND: str = "local"
     UPLOAD_DIR: str = "./uploads"
-    S3_BUCKET: str = ""
-    S3_REGION: str = ""
-    AWS_ACCESS_KEY_ID: str = ""
-    AWS_SECRET_ACCESS_KEY: str = ""
+
+    # Supabase Storage (used when STORAGE_BACKEND=supabase)
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
+    SUPABASE_BUCKET: str = "uploads"
 
     # Upload limits
     MAX_UPLOAD_SIZE_MB: int = 100
@@ -33,6 +37,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        env_file_encoding = "utf-8"
 
 
 settings = Settings()

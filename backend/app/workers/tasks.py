@@ -1,5 +1,6 @@
 """Celery tasks for async audio processing."""
 
+import os
 import uuid
 from datetime import datetime
 
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.core.celery_app import celery_app
+from app.core.storage import download_to_tempfile, is_local_path
 from app.models.models import AnalysisJob, AnalysisResult
 from app.services.analysis_service import analyze_melody
 
@@ -22,15 +24,19 @@ SyncSession = sessionmaker(bind=sync_engine)
 def process_analysis(self, job_id: str):
     """Process an uploaded file and extract the melody."""
     session: Session = SyncSession()
+    local_path: str | None = None
 
     try:
         job = session.query(AnalysisJob).filter(AnalysisJob.id == job_id).one()
         job.status = "processing"
         session.commit()
 
+        # Download file to local temp if stored in cloud
+        local_path = download_to_tempfile(job.input_file_url)
+
         # Run analysis
         result_data = analyze_melody(
-            file_path=job.input_file_url,
+            file_path=local_path,
             selected_key=job.selected_key,
             start_time=job.start_time,
             end_time=job.end_time,
@@ -61,4 +67,10 @@ def process_analysis(self, job_id: str):
 
         raise self.retry(exc=exc, countdown=10)
     finally:
+        # Clean up temp file if it was downloaded from cloud
+        if local_path and not is_local_path(job.input_file_url):
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
         session.close()

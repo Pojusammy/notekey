@@ -1,10 +1,10 @@
-import os
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from app.core.config import settings
+from app.core.storage import upload_file
 from app.schemas.schemas import UploadResponse
 
 router = APIRouter(prefix="/api", tags=["upload"])
@@ -16,7 +16,7 @@ ALLOWED_EXTENSIONS = {
 
 
 @router.post("/upload", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...)):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported file type: {ext}")
@@ -24,19 +24,11 @@ async def upload_file(file: UploadFile = File(...)):
     if file.size and file.size > settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
         raise HTTPException(400, f"File exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit")
 
+    content = await file.read()
     file_id = str(uuid.uuid4())
-    filename = f"{file_id}{ext}"
-
-    # Local storage for V1
-    upload_dir = Path(settings.UPLOAD_DIR)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    file_path = upload_dir / filename
-
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    storage_key = upload_file(content, file.filename or f"{file_id}{ext}")
 
     return UploadResponse(
-        fileUrl=str(file_path),
+        fileUrl=storage_key,
         fileId=file_id,
     )

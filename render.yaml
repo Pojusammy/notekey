@@ -1,0 +1,69 @@
+services:
+  # ── FastAPI Backend ──
+  - type: web
+    name: notekey-api
+    runtime: python
+    region: oregon
+    plan: starter
+    rootDir: backend
+    buildCommand: ./render-build.sh
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        sync: false
+      - key: CELERY_RESULT_BACKEND
+        sync: false
+      - key: STORAGE_BACKEND
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: uploads
+      - key: CORS_ORIGINS
+        sync: false
+      - key: DEBUG
+        value: "false"
+
+  # ── Celery Worker ──
+  - type: worker
+    name: notekey-worker
+    runtime: python
+    region: oregon
+    plan: starter
+    rootDir: backend
+    buildCommand: ./render-build.sh
+    startCommand: celery -A app.core.celery_app worker --loglevel=info --concurrency=2
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CELERY_BROKER_URL
+        sync: false
+      - key: CELERY_RESULT_BACKEND
+        sync: false
+      - key: STORAGE_BACKEND
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: uploads
+
+  # ── Redis ──
+  - type: redis
+    name: notekey-redis
+    region: oregon
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
