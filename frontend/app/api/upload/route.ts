@@ -4,7 +4,10 @@ import path from "path";
 import { randomUUID } from "crypto";
 
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
-const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+// /tmp is the only writable path on Vercel serverless; fall back to local uploads/ in dev
+const UPLOAD_DIR = process.env.VERCEL
+  ? path.join("/tmp", "notekey-uploads")
+  : path.join(process.cwd(), "uploads");
 
 const ALLOWED_EXTENSIONS = new Set([
   ".mp3", ".wav", ".m4a", ".aac",
