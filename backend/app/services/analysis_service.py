@@ -868,8 +868,14 @@ def analyze_melody(
     try:
         effective_key = song_key or selected_key or "C"
 
-        if analysis_mode == "roots":
-            # ── Root-note pipeline ──
+        if analysis_mode == "chords":
+            # ── MIR chord pipeline (Demucs + chroma_cqt) ──
+            # Proper source separation → correct root/inversion detection.
+            from app.services.mir_pipeline import analyze_chords
+            return analyze_chords(wav_path, effective_key)
+
+        elif analysis_mode == "roots":
+            # ── Root-note pipeline (Basic Pitch, legacy) ──
             # Use lower thresholds to capture full polyphonic content
             model_output, _, note_events = predict(
                 wav_path,

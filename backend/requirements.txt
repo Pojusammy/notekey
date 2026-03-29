@@ -10,6 +10,8 @@ librosa==0.10.2.post1
 basic-pitch>=0.3.0
 numpy<2
 soundfile==0.13.1
+demucs>=4.0.0
+scipy>=1.11.0
 pydantic==2.10.4
 pydantic-settings==2.7.1
 python-jose[cryptography]==3.3.0
